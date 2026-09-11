@@ -43,6 +43,7 @@ import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.MimeTypeMap
 import android.webkit.WebChromeClient.CustomViewCallback
+import android.webkit.WebView
 import android.widget.LinearLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -51,7 +52,9 @@ import androidx.appcompat.app.AlertDialog
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.graphics.toColorInt
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
@@ -73,6 +76,7 @@ import org.lineageos.jelly.models.PwaManifest
 import org.lineageos.jelly.models.WebShare
 import org.lineageos.jelly.shortcut.BackgroundShortcut
 import org.lineageos.jelly.shortcut.BackgroundShortcutActivity
+import org.lineageos.jelly.shortcut.BackgroundShortcutService
 import org.lineageos.jelly.ui.MenuDialog
 import org.lineageos.jelly.ui.UrlBarLayout
 import org.lineageos.jelly.utils.IntentUtils
@@ -86,7 +90,6 @@ import org.lineageos.jelly.viewmodels.HistoryViewModel
 import org.lineageos.jelly.viewmodels.SuggestionProviderViewModel
 import org.lineageos.jelly.webview.WebViewExt
 import org.lineageos.jelly.webview.WebViewExtActivity
-import org.lineageos.jelly.shortcut.BackgroundShortcutService
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -195,9 +198,9 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
     }
     private var urlIcon: Bitmap? = null
     private var url: String? = null
+    private var desktopMode = false
     private var incognito = false
     private var isFullscreenPwa = false
-    private var desktopMode = false
     private var customView: View? = null
     private var fullScreenCallback: CustomViewCallback? = null
     private lateinit var menuDialog: MenuDialog
@@ -220,6 +223,7 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WebView.setWebContentsDebuggingEnabled(sharedPreferencesExt.webDebuggingEnabled)
         setContentView(R.layout.activity_main)
         setSupportActionBar(toolbar)
         shortcutId = intent.getStringExtra(IntentUtils.EXTRA_SHORTCUT_ID)
@@ -228,20 +232,20 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
             true -> intent.getStringExtra(IntentUtils.EXTRA_PAGE_URL)
             false -> intent.dataString
         }
+        desktopMode = sharedPreferencesExt.desktopShortcuts.contains(shortcutId)
         incognito = intent.getBooleanExtra(IntentUtils.EXTRA_INCOGNITO, false)
         isFullscreenPwa = intent.getStringExtra(MANIFEST_DISPLAY)?.let {
             ALLOWED_FULLSCREEN_PWA_VALUES.contains(it)
         } ?: false
-        desktopMode = false
 
         // Restore from previous instance
         savedInstanceState?.let {
             url = url?.takeIf { url ->
                 url.isNotEmpty()
             } ?: it.getString(IntentUtils.EXTRA_URL, null)
+            desktopMode = it.getBoolean(IntentUtils.EXTRA_DESKTOP_MODE, desktopMode)
             incognito = it.getBoolean(IntentUtils.EXTRA_INCOGNITO, incognito)
             isFullscreenPwa = it.getBoolean(IntentUtils.EXTRA_FULLSCREEN_PWA, isFullscreenPwa)
-            desktopMode = it.getBoolean(IntentUtils.EXTRA_DESKTOP_MODE, false)
         }
 
         // Make sure prefs are set before loading them
@@ -254,7 +258,7 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
 
         urlBarLayout.isIncognito = incognito
 
-        menuDialog = MenuDialog(this) { option: MenuDialog.Option ->
+        menuDialog = MenuDialog(this, desktopMode) { option: MenuDialog.Option ->
             when (option) {
                 MenuDialog.Option.BACK -> webView.goBack()
                 MenuDialog.Option.FORWARD -> webView.goForward()
@@ -310,6 +314,14 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
                     desktopMode = !desktopMode
                     webView.isDesktopMode = desktopMode
                     menuDialog.isDesktopMode = desktopMode
+                }
+
+                MenuDialog.Option.DESKTOP_SHORTCUTS -> Intent(
+                    this,
+                    BackgroundShortcutActivity::class.java
+                ).apply {
+                    putExtra(BackgroundShortcutActivity.DESKTOP_SHORTCUTS, true)
+                    startActivity(this)
                 }
 
                 MenuDialog.Option.BACKGROUND_SHORTCUTS -> backgroundShortcutLauncher.launch(
@@ -464,7 +476,7 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
         constraintLayout.addView(webView)
         setUiMode()
         if (webView.initialized) return
-        webView.init(this, urlBarLayout, incognito)
+        webView.init(this, urlBarLayout, desktopMode, incognito)
         if (url != null || sharedPreferencesExt.homePageAutoload) {
             webView.loadUrl(url ?: sharedPreferencesExt.homePage)
         }
@@ -756,6 +768,19 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
         }
     }
 
+    override fun setStatusBarColor(color: String) {
+        if (!isFullscreenPwa) return
+        runCatching {
+            val color = color.toColorInt()
+            val isColorLight = UiUtils.isColorLight(color)
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = isColorLight
+                isAppearanceLightNavigationBars = isColorLight
+            }
+            window.decorView.setBackgroundColor(color)
+        }
+    }
+
     override fun webRequestPermissions(
         permissions: Array<String>,
         cb: ((granted: Array<String>) -> Unit)
@@ -872,24 +897,6 @@ class MainActivity : WebViewExtActivity(), SharedPreferences.OnSharedPreferenceC
                 true -> ConstraintLayout.LayoutParams.PARENT_ID
                 false -> ConstraintLayout.LayoutParams.UNSET
             }
-        }
-    }
-
-    private fun setStatusBarColor(hex: String) {
-        runCatching {
-            val color = Color.parseColor(hex)
-            if (UiUtils.isColorLight(color)) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    window.insetsController?.setSystemBarsAppearance(
-                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
-                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
-                    )
-                } else {
-                    @Suppress("Deprecation")
-                    window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-                }
-            }
-            window.decorView.setBackgroundColor(color)
         }
     }
 
